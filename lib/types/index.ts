@@ -51,6 +51,8 @@ export interface SourceBadge {
   id: string;
   name: string;
   count: number;
+  baseUrl?: string;
+  typeName?: string;
 }
 
 export interface TypeBadge {
@@ -118,6 +120,7 @@ export interface FavoriteItem {
   type?: string; // movie type/category
   year?: string;
   remarks?: string; // e.g., episode info
+  sourceMap?: Record<string, string | number>; // Maps source name to videoId for source switching
 }
 
 // API Response Structures

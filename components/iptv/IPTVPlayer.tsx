@@ -3,35 +3,48 @@
 /**
  * IPTVPlayer - Player for IPTV streams with controls, volume, progress, and sidebar.
  * Supports HLS (via HLS.js), native HLS (Safari), and direct video playback.
- * Routes streams through proxy to avoid CORS when direct access fails.
+ * Features multi-level sidebar (source -> group -> channels), multi-route collapse,
+ * and optimized search performance.
  */
 
-import { useRef, useEffect, useState, useCallback, useMemo } from 'react';
+import { useRef, useEffect, useState, useCallback, useMemo, useTransition } from 'react';
 import Hls from 'hls.js';
 import { Icons } from '@/components/ui/Icon';
 import type { M3UChannel } from '@/lib/utils/m3u-parser';
+import type { IPTVSource } from '@/lib/store/iptv-store';
+import { settingsStore, DEFAULT_SEEK_STEP_SECONDS } from '@/lib/store/settings-store';
+import { shouldHidePlayerCursor } from '@/lib/player/cursor-visibility';
 
 const HLS_LIVE_CONFIG: Partial<Hls['config']> = {
   enableWorker: true,
   lowLatencyMode: true,
   liveDurationInfinity: true,
   manifestLoadingTimeOut: 10000,
-  manifestLoadingMaxRetry: 2,
+  manifestLoadingMaxRetry: 3,
   levelLoadingTimeOut: 10000,
-  fragLoadingTimeOut: 15000,
+  fragLoadingTimeOut: 20000,
+  // Prefer H.264 (avc) over HEVC (hev/hvc) for maximum browser compatibility
+  preferManagedMediaSource: false,
 };
 
-const LOADING_TIMEOUT_MS = 20000;
+const LOADING_TIMEOUT_MS = 30000;
+const MAX_VISIBLE_ROUTES = 3;
 
 interface IPTVPlayerProps {
   channel: M3UChannel;
   onClose: () => void;
   channels: M3UChannel[];
   onChannelChange: (channel: M3UChannel) => void;
+  channelsBySource?: Record<string, { channels: M3UChannel[]; groups: string[] }>;
+  sources?: IPTVSource[];
 }
 
-function getProxiedUrl(url: string): string {
-  return `/api/iptv/stream?url=${encodeURIComponent(url)}`;
+function getProxiedUrl(url: string, ua?: string, referer?: string): string {
+  let proxyUrl = `/api/iptv/stream?`;
+  if (ua) proxyUrl += `ua=${encodeURIComponent(ua)}&`;
+  if (referer) proxyUrl += `referer=${encodeURIComponent(referer)}&`;
+  proxyUrl += `url=${encodeURIComponent(url)}`;
+  return proxyUrl;
 }
 
 function formatTime(seconds: number): string {
@@ -43,7 +56,23 @@ function formatTime(seconds: number): string {
   return `${m}:${s.toString().padStart(2, '0')}`;
 }
 
-export function IPTVPlayer({ channel, onClose, channels, onChannelChange }: IPTVPlayerProps) {
+function getSeekRange(video: HTMLVideoElement): { start: number; end: number; duration: number } | null {
+  if (video.seekable.length > 0) {
+    const start = video.seekable.start(0);
+    const end = video.seekable.end(video.seekable.length - 1);
+    if (isFinite(start) && isFinite(end) && end > start) {
+      return { start, end, duration: end - start };
+    }
+  }
+
+  if (isFinite(video.duration) && video.duration > 0) {
+    return { start: 0, end: video.duration, duration: video.duration };
+  }
+
+  return null;
+}
+
+export function IPTVPlayer({ channel, onClose, channels, onChannelChange, channelsBySource, sources }: IPTVPlayerProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const hlsRef = useRef<Hls | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -54,21 +83,44 @@ export function IPTVPlayer({ channel, onClose, channels, onChannelChange }: IPTV
   const [error, setError] = useState<string | null>(null);
   const [showSidebar, setShowSidebar] = useState(false);
   const [sidebarSearch, setSidebarSearch] = useState('');
+  const [filteredResults, setFilteredResults] = useState<M3UChannel[]>([]);
+  const [isSearching, startSearchTransition] = useTransition();
+  const [sidebarVisibleCount, setSidebarVisibleCount] = useState(50);
   const [isLoading, setIsLoading] = useState(true);
   const [isPlaying, setIsPlaying] = useState(false);
   const [showControls, setShowControls] = useState(true);
   const [isLive, setIsLive] = useState(true);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
+  const [seekWindow, setSeekWindow] = useState<{ start: number; end: number; duration: number } | null>(null);
   const [volume, setVolume] = useState(1);
   const [isMuted, setIsMuted] = useState(false);
   const [showVolumeSlider, setShowVolumeSlider] = useState(false);
   const [currentRouteIndex, setCurrentRouteIndex] = useState(0);
   const [isFullscreen, setIsFullscreen] = useState(false);
+  const [showAllRoutes, setShowAllRoutes] = useState(false);
+  const [seekStepSeconds, setSeekStepSeconds] = useState(DEFAULT_SEEK_STEP_SECONDS);
+
+  // Multi-level sidebar state
+  const [expandedSources, setExpandedSources] = useState<Set<string>>(new Set());
+  const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
+
+  // Whether we have multi-source data
+  const hasMultiSource = channelsBySource && sources && sources.length > 0;
+  const activeSourceId = channel.sourceId || null;
+  const activeGroupKey = activeSourceId && channel.group ? `${activeSourceId}::${channel.group}` : null;
+  const activeSource = useMemo(
+    () => (activeSourceId && sources ? sources.find((source) => source.id === activeSourceId) || null : null),
+    [activeSourceId, sources]
+  );
 
   // Get current route URL
   const routes = channel.routes || [channel.url];
   const currentUrl = routes[currentRouteIndex] || channel.url;
+
+  // Route display - collapse if > MAX_VISIBLE_ROUTES
+  const visibleRoutes = showAllRoutes ? routes : routes.slice(0, MAX_VISIBLE_ROUTES);
+  const hasMoreRoutes = routes.length > MAX_VISIBLE_ROUTES;
 
   // Auto-scroll to active channel in sidebar
   useEffect(() => {
@@ -76,6 +128,26 @@ export function IPTVPlayer({ channel, onClose, channels, onChannelChange }: IPTV
       activeChannelRef.current.scrollIntoView({ behavior: 'smooth', block: 'center' });
     }
   }, [showSidebar, channel.url]);
+
+  useEffect(() => {
+    const syncSeekStep = () => {
+      setSeekStepSeconds(settingsStore.getSettings().seekStepSeconds ?? DEFAULT_SEEK_STEP_SECONDS);
+    };
+
+    syncSeekStep();
+    const unsubscribe = settingsStore.subscribe(syncSeekStep);
+    return () => unsubscribe();
+  }, []);
+
+  // Auto-expand the source/group containing the active channel
+  useEffect(() => {
+    if (channel.sourceId) {
+      setExpandedSources(prev => new Set(prev).add(channel.sourceId!));
+      if (channel.group) {
+        setExpandedGroups(prev => new Set(prev).add(`${channel.sourceId}::${channel.group}`));
+      }
+    }
+  }, [channel.sourceId, channel.group]);
 
   // Track fullscreen changes
   useEffect(() => {
@@ -103,20 +175,31 @@ export function IPTVPlayer({ channel, onClose, channels, onChannelChange }: IPTV
     const onPlay = () => setIsPlaying(true);
     const onPause = () => setIsPlaying(false);
     const onTimeUpdate = () => {
+      const range = getSeekRange(video);
       setCurrentTime(video.currentTime);
-      const dur = video.duration;
-      if (isFinite(dur) && dur > 0) {
-        setDuration(dur);
+      setSeekWindow(range);
+      if (range) {
+        setDuration(range.duration);
         setIsLive(false);
       } else {
+        const dur = video.duration;
+        if (isFinite(dur) && dur > 0) {
+          setDuration(dur);
+        }
         setIsLive(true);
       }
     };
     const onDurationChange = () => {
-      const dur = video.duration;
-      if (isFinite(dur) && dur > 0) {
-        setDuration(dur);
+      const range = getSeekRange(video);
+      setSeekWindow(range);
+      if (range) {
+        setDuration(range.duration);
         setIsLive(false);
+      } else {
+        const dur = video.duration;
+        if (isFinite(dur) && dur > 0) {
+          setDuration(dur);
+        }
       }
     };
     const onVolumeChange = () => {
@@ -148,6 +231,7 @@ export function IPTVPlayer({ channel, onClose, channels, onChannelChange }: IPTV
     setIsLive(true);
     setCurrentTime(0);
     setDuration(0);
+    setSeekWindow(null);
 
     // Clean up previous
     if (hlsRef.current) {
@@ -161,7 +245,12 @@ export function IPTVPlayer({ channel, onClose, channels, onChannelChange }: IPTV
     video.removeAttribute('src');
     video.load();
 
-    const proxiedUrl = getProxiedUrl(url);
+    const proxiedUrl = getProxiedUrl(url, channel.httpUserAgent, channel.httpReferrer);
+    const hasCustomHeaders = !!(channel.httpUserAgent || channel.httpReferrer);
+    // When custom headers are needed, skip direct attempt (browsers cannot set
+    // User-Agent on XHR/fetch). Always go through our proxy which can forward
+    // the headers server-side. This fixes audio-only issues on CCTV and similar.
+    const initialUrl = hasCustomHeaders ? proxiedUrl : url;
 
     // Global loading timeout
     let loadingResolved = false;
@@ -239,7 +328,10 @@ export function IPTVPlayer({ channel, onClose, channels, onChannelChange }: IPTV
         hlsRef.current = hlsProxy;
         hlsProxy.loadSource(proxiedUrl);
         hlsProxy.attachMedia(video);
+
+        // Filter HEVC levels for proxy attempt too
         hlsProxy.on(Hls.Events.MANIFEST_PARSED, () => {
+          filterHEVCLevels(hlsProxy);
           markLoaded();
           video.play().catch(() => {});
         });
@@ -256,10 +348,30 @@ export function IPTVPlayer({ channel, onClose, channels, onChannelChange }: IPTV
         });
       };
 
-      // First try direct URL with HLS.js
-      hls.loadSource(url);
+      // Helper: Filter out HEVC levels that browser may not support (fixes audio-only issue)
+      const filterHEVCLevels = (hlsInstance: Hls) => {
+        if (!hlsInstance.levels || hlsInstance.levels.length <= 1) return;
+        const h264Levels = hlsInstance.levels
+          .map((level, index) => ({ level, index }))
+          .filter(({ level }) => {
+            const codec = level.videoCodec?.toLowerCase() || '';
+            // Keep levels without HEVC codec (H.264 or unknown)
+            return !codec.includes('hev') && !codec.includes('h265') && !codec.includes('hvc');
+          });
+        // If we have H.264 levels, restrict to those
+        if (h264Levels.length > 0 && h264Levels.length < hlsInstance.levels.length) {
+          console.info('[IPTV] Filtering HEVC levels, using H.264 only for compatibility');
+          // Set level to first H.264 level
+          hlsInstance.currentLevel = h264Levels[0].index;
+        }
+      };
+
+      // First try initial URL (direct or proxied based on custom headers)
+      hls.loadSource(initialUrl);
       hls.attachMedia(video);
       hls.on(Hls.Events.MANIFEST_PARSED, () => {
+        // Filter HEVC levels to prevent audio-only playback
+        filterHEVCLevels(hls);
         markLoaded();
         video.play().catch(() => {});
       });
@@ -276,12 +388,17 @@ export function IPTVPlayer({ channel, onClose, channels, onChannelChange }: IPTV
       });
     } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
       // Native HLS (Safari/iOS)
-      video.src = url;
+      video.src = initialUrl;
       video.addEventListener('canplay', () => {
         markLoaded();
         video.play().catch(() => {});
       }, { once: true });
       video.addEventListener('error', () => {
+        // If direct failed, try proxy; if already proxied, fail
+        if (initialUrl === proxiedUrl) {
+          markError('播放错误');
+          return;
+        }
         video.src = proxiedUrl;
         video.addEventListener('canplay', () => {
           markLoaded();
@@ -293,12 +410,16 @@ export function IPTVPlayer({ channel, onClose, channels, onChannelChange }: IPTV
       }, { once: true });
     } else {
       // Direct video fallback
-      video.src = url;
+      video.src = initialUrl;
       video.addEventListener('canplay', () => {
         markLoaded();
         video.play().catch(() => {});
       }, { once: true });
       video.addEventListener('error', () => {
+        if (initialUrl === proxiedUrl) {
+          markError('播放错误，请尝试其他频道');
+          return;
+        }
         video.src = proxiedUrl;
         video.addEventListener('canplay', () => {
           markLoaded();
@@ -309,7 +430,7 @@ export function IPTVPlayer({ channel, onClose, channels, onChannelChange }: IPTV
         }, { once: true });
       }, { once: true });
     }
-  }, []);
+  }, [channel.httpUserAgent, channel.httpReferrer]);
 
   // Load on channel/route change
   useEffect(() => {
@@ -329,6 +450,7 @@ export function IPTVPlayer({ channel, onClose, channels, onChannelChange }: IPTV
   // Reset route index when channel changes
   useEffect(() => {
     setCurrentRouteIndex(0);
+    setShowAllRoutes(false);
   }, [channel.name, channel.url]);
 
   // Playback controls
@@ -358,11 +480,28 @@ export function IPTVPlayer({ channel, onClose, channels, onChannelChange }: IPTV
     if (isLive) return;
     const video = videoRef.current;
     const bar = progressRef.current;
-    if (!video || !duration || !bar) return;
+    if (!video || !bar) return;
+    const seekRange = getSeekRange(video);
+    if (!seekRange) return;
     const rect = bar.getBoundingClientRect();
     const ratio = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
-    video.currentTime = ratio * duration;
+    video.currentTime = seekRange.start + ratio * seekRange.duration;
   };
+
+  const progressPercent = useMemo(() => {
+    if (seekWindow) {
+      return Math.max(0, Math.min(100, ((currentTime - seekWindow.start) / seekWindow.duration) * 100));
+    }
+    if (!duration) return 0;
+    return Math.max(0, Math.min(100, (currentTime / duration) * 100));
+  }, [currentTime, duration, seekWindow]);
+
+  const shouldHideCursor = shouldHidePlayerCursor({
+    isFullscreen,
+    isPlaying,
+    showControls,
+    hasInteractiveOverlay: showSidebar || showVolumeSlider || Boolean(error),
+  });
 
   const toggleFullscreen = async () => {
     if (!containerRef.current) return;
@@ -404,14 +543,14 @@ export function IPTVPlayer({ channel, onClose, channels, onChannelChange }: IPTV
         case 'l':
           e.preventDefault();
           if (!isLive && isFinite(video.duration)) {
-            video.currentTime = Math.min(video.duration, video.currentTime + 10);
+            video.currentTime = Math.min(video.duration, video.currentTime + seekStepSeconds);
           }
           break;
         case 'arrowleft':
         case 'j':
           e.preventDefault();
           if (!isLive && isFinite(video.duration)) {
-            video.currentTime = Math.max(0, video.currentTime - 10);
+            video.currentTime = Math.max(0, video.currentTime - seekStepSeconds);
           }
           break;
         case 'arrowup':
@@ -432,16 +571,225 @@ export function IPTVPlayer({ channel, onClose, channels, onChannelChange }: IPTV
 
   const VolumeIcon = isMuted || volume === 0 ? Icons.VolumeX : volume < 0.5 ? Icons.Volume1 : Icons.Volume2;
 
-  const filteredSidebarChannels = useMemo(() => {
-    if (!sidebarSearch.trim()) return channels;
-    const q = sidebarSearch.toLowerCase().trim();
-    return channels.filter(ch => ch.name.toLowerCase().includes(q));
-  }, [channels, sidebarSearch]);
+  // Debounce search with useTransition for non-blocking rendering
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      const q = sidebarSearch.toLowerCase().trim();
+      if (!q) {
+        setFilteredResults([]);
+        setSidebarVisibleCount(50);
+        return;
+      }
+      startSearchTransition(() => {
+        const results = channels.filter(ch => ch.name.toLowerCase().includes(q));
+        setFilteredResults(results);
+        setSidebarVisibleCount(50);
+      });
+    }, 200);
+    return () => clearTimeout(timer);
+  }, [sidebarSearch, channels]);
+
+  const isSearchMode = sidebarSearch.trim().length > 0;
+
+  // Toggle source expansion
+  const toggleSource = useCallback((sourceId: string) => {
+    setExpandedSources(prev => {
+      const next = new Set(prev);
+      if (next.has(sourceId)) next.delete(sourceId);
+      else next.add(sourceId);
+      return next;
+    });
+  }, []);
+
+  // Toggle group expansion
+  const toggleGroup = useCallback((key: string) => {
+    setExpandedGroups(prev => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  }, []);
+
+  const toggleActiveSource = useCallback(() => {
+    if (!activeSourceId) return;
+    toggleSource(activeSourceId);
+  }, [activeSourceId, toggleSource]);
+
+  const toggleActiveGroup = useCallback(() => {
+    if (!activeSourceId || !channel.group) return;
+    setExpandedSources(prev => new Set(prev).add(activeSourceId));
+    toggleGroup(`${activeSourceId}::${channel.group}`);
+  }, [activeSourceId, channel.group, toggleGroup]);
+
+  // Render a channel button
+  const renderChannelButton = (ch: M3UChannel, i: number) => {
+    const isActive = ch.name === channel.name && ch.url === channel.url;
+    return (
+      <button
+        key={`${ch.sourceId || ''}-${ch.name}-${i}`}
+        ref={isActive ? activeChannelRef : undefined}
+        onClick={(e) => {
+          e.stopPropagation();
+          onChannelChange(ch);
+        }}
+        className={`w-full text-left px-3 py-2 rounded-lg text-sm transition-colors cursor-pointer ${
+          isActive
+            ? 'bg-[var(--accent-color)] text-white'
+            : 'text-white/70 hover:bg-white/10 hover:text-white'
+        }`}
+      >
+        <div className="flex items-center gap-2">
+          {isActive && (
+            <span className="w-1.5 h-1.5 rounded-full bg-white flex-shrink-0 animate-pulse" />
+          )}
+          <span className="truncate flex-1">{ch.name}</span>
+          {ch.routes && ch.routes.length > 1 && (
+            <span className={`text-[10px] px-1.5 py-0.5 rounded flex-shrink-0 ${
+              isActive ? 'bg-white/20' : 'bg-white/5 text-white/40'
+            }`}>
+              {ch.routes.length}线路
+            </span>
+          )}
+        </div>
+      </button>
+    );
+  };
+
+  // Render multi-level sidebar content
+  const renderMultiLevelSidebar = () => {
+    if (!channelsBySource || !sources) return null;
+    const orderedSources = activeSourceId
+      ? [
+        ...sources.filter((source) => source.id === activeSourceId),
+        ...sources.filter((source) => source.id !== activeSourceId),
+      ]
+      : sources;
+
+    return (
+      <div className="p-1">
+        {orderedSources.map(source => {
+          const sourceData = channelsBySource[source.id];
+          if (!sourceData || sourceData.channels.length === 0) return null;
+
+          const isExpanded = expandedSources.has(source.id);
+          const isActiveSource = source.id === activeSourceId;
+          const orderedGroups = isActiveSource && channel.group
+            ? [channel.group, ...sourceData.groups.filter((group) => group !== channel.group)]
+            : sourceData.groups;
+
+          return (
+            <div key={source.id} className="mb-1">
+              {/* Source Header */}
+              <button
+                onClick={(e) => { e.stopPropagation(); toggleSource(source.id); }}
+                className={`w-full flex items-center justify-between px-3 py-2 rounded-lg text-sm font-medium transition-colors cursor-pointer ${
+                  isActiveSource
+                    ? 'bg-white/10 text-white'
+                    : 'text-white/90 hover:bg-white/10'
+                }`}
+              >
+                <div className="flex items-center gap-2 min-w-0">
+                  <Icons.TV size={14} className="flex-shrink-0 text-[var(--accent-color)]" />
+                  <span className="truncate">{source.name}</span>
+                  <span className="text-[10px] text-white/40 flex-shrink-0">{sourceData.channels.length}</span>
+                </div>
+                <Icons.ChevronDown
+                  size={14}
+                  className={`flex-shrink-0 text-white/40 transition-transform duration-200 ${isExpanded ? 'rotate-180' : ''}`}
+                />
+              </button>
+
+              {/* Source Content */}
+              {isExpanded && (
+                <div className="ml-2 border-l border-white/10 pl-1">
+                  {orderedGroups.length > 0 ? (
+                    // Has groups — show group-level
+                    orderedGroups.map(group => {
+                      const groupKey = `${source.id}::${group}`;
+                      const groupExpanded = expandedGroups.has(groupKey);
+                      const groupChannels = sourceData.channels.filter(ch => ch.group === group);
+                      const isActiveGroup = groupKey === activeGroupKey;
+
+                      return (
+                        <div key={groupKey} className="mb-0.5">
+                          <button
+                            onClick={(e) => { e.stopPropagation(); toggleGroup(groupKey); }}
+                            className={`w-full flex items-center justify-between px-2 py-1.5 rounded text-xs transition-colors cursor-pointer ${
+                              isActiveGroup
+                                ? 'bg-white/10 text-white'
+                                : 'text-white/60 hover:bg-white/5'
+                            }`}
+                          >
+                            <div className="flex items-center gap-1.5 min-w-0">
+                              <Icons.Tag size={12} className="flex-shrink-0" />
+                              <span className="truncate">{group}</span>
+                              <span className="text-[10px] text-white/30 flex-shrink-0">{groupChannels.length}</span>
+                            </div>
+                            <Icons.ChevronDown
+                              size={12}
+                              className={`flex-shrink-0 text-white/30 transition-transform duration-200 ${groupExpanded ? 'rotate-180' : ''}`}
+                            />
+                          </button>
+                          {groupExpanded && (
+                            <div className="ml-2">
+                              {groupChannels.map((ch, i) => renderChannelButton(ch, i))}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })
+                  ) : (
+                    // No groups — show channels directly
+                    sourceData.channels.map((ch, i) => renderChannelButton(ch, i))
+                  )}
+
+                  {/* Ungrouped channels */}
+                  {sourceData.groups.length > 0 && (() => {
+                    const ungrouped = sourceData.channels.filter(ch => !ch.group);
+                    if (ungrouped.length === 0) return null;
+                    return (
+                      <div className="mb-0.5">
+                        <div className="px-2 py-1 text-[10px] text-white/30">未分组</div>
+                        {ungrouped.map((ch, i) => renderChannelButton(ch, i))}
+                      </div>
+                    );
+                  })()}
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    );
+  };
+
+  // Render flat channel list (search results or single-source fallback)
+  const renderFlatChannelList = (channelList: M3UChannel[]) => {
+    const visible = channelList.slice(0, sidebarVisibleCount);
+    return (
+      <div className="p-1">
+        {visible.map((ch, i) => renderChannelButton(ch, i))}
+        {channelList.length > sidebarVisibleCount && (
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              setSidebarVisibleCount(prev => prev + 50);
+            }}
+            className="w-full py-2 text-xs text-white/50 hover:text-white/80 transition-colors cursor-pointer"
+          >
+            显示更多 ({channelList.length - sidebarVisibleCount} 个频道)
+          </button>
+        )}
+      </div>
+    );
+  };
 
   return (
     <div
       ref={containerRef}
       className="fixed inset-0 z-[9999] bg-black flex"
+      style={{ cursor: shouldHideCursor ? 'none' : undefined }}
       onMouseMove={resetControlsTimeout}
       onClick={(e) => {
         if ((e.target as HTMLElement).closest('[data-controls]') || (e.target as HTMLElement).closest('[data-sidebar]')) return;
@@ -473,7 +821,7 @@ export function IPTVPlayer({ channel, onClose, channels, onChannelChange }: IPTV
           <div className="absolute inset-0 flex items-center justify-center bg-black/80">
             <div className="text-center" data-controls>
               <p className="text-red-400 text-sm mb-3">{error}</p>
-              <div className="flex gap-2 justify-center">
+              <div className="flex gap-2 flex-wrap justify-center">
                 <button
                   onClick={(e) => { e.stopPropagation(); loadChannel(currentUrl); }}
                   className="px-4 py-2 bg-white/10 hover:bg-white/20 rounded-lg text-white text-sm transition-colors cursor-pointer"
@@ -535,7 +883,7 @@ export function IPTVPlayer({ channel, onClose, channels, onChannelChange }: IPTV
               >
                 <div
                   className="h-full bg-[var(--accent-color)] rounded-full relative pointer-events-none"
-                  style={{ width: `${(currentTime / duration) * 100}%` }}
+                  style={{ width: `${progressPercent}%` }}
                 >
                   <div className="absolute right-0 top-1/2 -translate-y-1/2 w-3 h-3 bg-white rounded-full opacity-0 group-hover:opacity-100 transition-opacity" />
                 </div>
@@ -561,10 +909,10 @@ export function IPTVPlayer({ channel, onClose, channels, onChannelChange }: IPTV
 
             <div className="flex-1" />
 
-            {/* Route Selector */}
+            {/* Route Selector - collapsed */}
             {routes.length > 1 && (
-              <div className="flex gap-1" data-controls>
-                {routes.map((_, i) => (
+              <div className="flex gap-1 items-center" data-controls>
+                {visibleRoutes.map((_, i) => (
                   <button
                     key={i}
                     onClick={(e) => { e.stopPropagation(); setCurrentRouteIndex(i); }}
@@ -577,6 +925,14 @@ export function IPTVPlayer({ channel, onClose, channels, onChannelChange }: IPTV
                     线路{i + 1}
                   </button>
                 ))}
+                {hasMoreRoutes && (
+                  <button
+                    onClick={(e) => { e.stopPropagation(); setShowAllRoutes(!showAllRoutes); }}
+                    className="px-2 py-0.5 text-[10px] rounded bg-white/5 text-white/40 hover:bg-white/10 hover:text-white/60 transition-colors cursor-pointer"
+                  >
+                    {showAllRoutes ? '收起' : `+${routes.length - MAX_VISIBLE_ROUTES}`}
+                  </button>
+                )}
               </div>
             )}
 
@@ -651,48 +1007,63 @@ export function IPTVPlayer({ channel, onClose, channels, onChannelChange }: IPTV
                   onClick={(e) => e.stopPropagation()}
                   className="w-full pl-7 pr-2 py-1.5 bg-white/5 border border-white/10 rounded-lg text-xs text-white placeholder:text-white/30 focus:outline-none focus:border-white/20"
                 />
+                {isSearching && (
+                  <div className="absolute right-2.5 top-1/2 -translate-y-1/2">
+                    <div className="w-3 h-3 border border-white/30 border-t-white rounded-full animate-spin" />
+                  </div>
+                )}
               </div>
             </div>
-          </div>
-          <div className="p-1">
-            {filteredSidebarChannels.map((ch, i) => {
-              const isActive = ch.name === channel.name && ch.url === channel.url;
-              return (
-                <button
-                  key={`${ch.name}-${i}`}
-                  ref={isActive ? activeChannelRef : undefined}
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    onChannelChange(ch);
-                  }}
-                  className={`w-full text-left px-3 py-2 rounded-lg text-sm transition-colors cursor-pointer ${
-                    isActive
-                      ? 'bg-[var(--accent-color)] text-white'
-                      : 'text-white/70 hover:bg-white/10 hover:text-white'
-                  }`}
-                >
-                  <div className="flex items-center gap-2">
-                    {isActive && (
-                      <span className="w-1.5 h-1.5 rounded-full bg-white flex-shrink-0 animate-pulse" />
-                    )}
-                    <span className="truncate flex-1">{ch.name}</span>
-                    {ch.routes && ch.routes.length > 1 && (
-                      <span className={`text-[10px] px-1.5 py-0.5 rounded flex-shrink-0 ${
-                        isActive ? 'bg-white/20' : 'bg-white/5 text-white/40'
-                      }`}>
-                        {ch.routes.length}线路
-                      </span>
-                    )}
-                  </div>
-                  {ch.group && (
-                    <span className={`text-[10px] ${isActive ? 'text-white/60' : 'text-white/30'}`}>
-                      {ch.group}
-                    </span>
+            {(activeSource || channel.group) && (
+              <div className="px-3 py-2 border-b border-white/10">
+                <div className="flex items-center gap-1.5 flex-wrap">
+                  <span className="text-[10px] uppercase tracking-[0.18em] text-white/30">当前</span>
+                  {activeSource && (
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        toggleActiveSource();
+                      }}
+                      className={`px-2 py-1 rounded-full text-[11px] border transition-colors cursor-pointer ${
+                        activeSourceId && expandedSources.has(activeSourceId)
+                          ? 'bg-[var(--accent-color)] border-[var(--accent-color)] text-white'
+                          : 'bg-white/5 border-white/10 text-white/80 hover:bg-white/10'
+                      }`}
+                    >
+                      源: {activeSource.name}
+                    </button>
                   )}
-                </button>
-              );
-            })}
+                  {channel.group && activeGroupKey && (
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        toggleActiveGroup();
+                      }}
+                      className={`px-2 py-1 rounded-full text-[11px] border transition-colors cursor-pointer ${
+                        expandedGroups.has(activeGroupKey)
+                          ? 'bg-[var(--accent-color)] border-[var(--accent-color)] text-white'
+                          : 'bg-white/5 border-white/10 text-white/80 hover:bg-white/10'
+                      }`}
+                    >
+                      标签: {channel.group}
+                    </button>
+                  )}
+                </div>
+              </div>
+            )}
           </div>
+
+          {/* Sidebar Content */}
+          {isSearchMode ? (
+            // Search mode — flat list of filtered results
+            renderFlatChannelList(filteredResults)
+          ) : hasMultiSource ? (
+            // Multi-source mode — hierarchical list
+            renderMultiLevelSidebar()
+          ) : (
+            // Single source or fallback — flat list
+            renderFlatChannelList(channels)
+          )}
         </div>
       )}
     </div>

@@ -10,7 +10,9 @@ import { LatencyBadge } from '@/components/ui/LatencyBadge';
 import { FavoriteButton } from '@/components/favorites/FavoriteButton';
 
 import { Video } from '@/lib/types';
+import { htmlToText } from '@/lib/utils/html';
 import { parseVideoTitle } from '@/lib/utils/video';
+import type { ResolutionInfo } from '@/lib/hooks/useResolutionProbe';
 
 interface VideoCardProps {
     video: Video;
@@ -20,6 +22,8 @@ interface VideoCardProps {
     onCardClick: (e: React.MouseEvent, cardId: string, videoUrl: string) => void;
     isPremium?: boolean;
     latencies?: Record<string, number>;
+    resolution?: ResolutionInfo | null;
+    isProbing?: boolean;
 }
 
 export const VideoCard = memo<VideoCardProps>(({
@@ -29,9 +33,12 @@ export const VideoCard = memo<VideoCardProps>(({
     isActive,
     onCardClick,
     isPremium = false,
-    latencies = {}
+    latencies = {},
+    resolution,
+    isProbing = false,
 }) => {
     const displayLatency = latencies[video.source] ?? video.latency;
+    const displayRemarks = htmlToText(video.vod_remarks);
     return (
         <div
             style={{
@@ -73,16 +80,26 @@ export const VideoCard = memo<VideoCardProps>(({
                                 referrerPolicy="no-referrer"
                                 onError={(e) => {
                                     const target = e.currentTarget as HTMLImageElement;
-                                    target.style.opacity = '0';
+                                    if (target.dataset.fallback === '1') {
+                                        target.style.opacity = '0';
+                                        return;
+                                    }
+                                    target.dataset.fallback = '1';
+                                    target.src = '/placeholder-poster.svg';
                                 }}
                             />
                         ) : (
-                            <div className="w-full h-full flex items-center justify-center">
-                                <Icons.Film size={64} className="text-[var(--text-color-secondary)]" />
-                            </div>
+                            <Image
+                                src="/placeholder-poster.svg"
+                                alt={video.vod_name}
+                                fill
+                                className="object-cover rounded-[var(--radius-2xl)]"
+                                sizes="(max-width: 640px) 33vw, (max-width: 1024px) 20vw, 16vw"
+                                unoptimized
+                            />
                         )}
 
-                        {/* Fallback Icon - visible when image fails */}
+                        {/* Fallback Icon - visible when image fails completely */}
                         <div className="absolute inset-0 flex flex-col items-center justify-center -z-10 gap-2">
                             <Icons.Film size={48} className="text-[var(--text-color-secondary)] opacity-40" />
                             <span className="text-xs text-[var(--text-color-secondary)] opacity-60 px-2 text-center line-clamp-2">{video.vod_name}</span>
@@ -90,15 +107,14 @@ export const VideoCard = memo<VideoCardProps>(({
 
                         {/* Badge Container */}
                         <div className="absolute top-2 left-2 right-2 z-10 flex items-center justify-between gap-1">
-                            {video.sourceName && (
-                                <Badge variant="primary" className="bg-[var(--accent-color)] flex-shrink-0 max-w-[50%] truncate">
-                                    {video.sourceName}
-                                </Badge>
-                            )}
+                            <div className="flex items-center gap-1 min-w-0">
+                                {video.sourceName && (
+                                    <Badge variant="primary" className="bg-[var(--accent-color)] flex-shrink-0 max-w-[100%] truncate">
+                                        {video.sourceName}
+                                    </Badge>
+                                )}
+                            </div>
 
-                            {displayLatency !== undefined && (
-                                <LatencyBadge latency={displayLatency} className="flex-shrink-0" />
-                            )}
                         </div>
 
                         {/* Favorite Button - Top Right */}
@@ -150,26 +166,35 @@ export const VideoCard = memo<VideoCardProps>(({
                     {/* Info */}
                     <div className="p-3 flex-1 flex flex-col">
                         {(() => {
-                            const { cleanTitle, quality } = parseVideoTitle(video.vod_name);
-                            // Visual priority: Quality from title tag, then vod_remarks
-                            const displayQuality = quality || video.vod_remarks;
+                            const { cleanTitle } = parseVideoTitle(video.vod_name);
 
                             return (
                                 <>
                                     <h4 className="font-semibold text-sm text-[var(--text-color)] line-clamp-2 min-h-[2.5rem] mb-1">
                                         {cleanTitle}
                                     </h4>
-                                    {displayQuality && (
-                                        <p className="text-xs text-[var(--text-color-secondary)] font-medium">
-                                            {displayQuality}
+                                    {displayRemarks && (
+                                        <p
+                                            className="text-xs text-[var(--text-color-secondary)] mt-1 line-clamp-1"
+                                            title={displayRemarks}
+                                        >
+                                            {displayRemarks}
                                         </p>
                                     )}
-                                    {/* Hide remarks if it was used as quality to avoid duplication */}
-                                    {video.vod_remarks && video.vod_remarks !== displayQuality && (
-                                        <p className="text-xs text-[var(--text-color-secondary)] mt-1 line-clamp-1">
-                                            {video.vod_remarks}
-                                        </p>
-                                    )}
+                                    <div className="flex items-center gap-1.5 flex-wrap">
+                                        {resolution ? (
+                                            <span className={`inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-bold text-white ${resolution.color}`}>
+                                                {resolution.label}
+                                            </span>
+                                        ) : isProbing ? (
+                                            <span className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-bold text-white/50 bg-gray-500/50 animate-pulse">
+                                                ...
+                                            </span>
+                                        ) : null}
+                                        {displayLatency !== undefined && (
+                                            <LatencyBadge latency={displayLatency} className="flex-shrink-0" />
+                                        )}
+                                    </div>
                                     {video.vod_lang && (
                                         <p className="text-xs text-[var(--text-color-secondary)] mt-1">
                                             {video.vod_lang}
@@ -186,4 +211,3 @@ export const VideoCard = memo<VideoCardProps>(({
 });
 
 VideoCard.displayName = 'VideoCard';
-

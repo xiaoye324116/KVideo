@@ -2,13 +2,15 @@
 
 import { Suspense, useEffect, useMemo, useState, useCallback, useRef } from 'react';
 import { useSearchParams, useRouter } from 'next/navigation';
-import { Button } from '@/components/ui/Button';
 import { VideoPlayer } from '@/components/player/VideoPlayer';
 import { VideoMetadata } from '@/components/player/VideoMetadata';
 import { EpisodeList } from '@/components/player/EpisodeList';
 import { PlayerError } from '@/components/player/PlayerError';
 import { SourceInfo } from '@/components/player/EpisodeList';
 import type { VideoSource } from '@/lib/types';
+import type { VideoResolutionInfo } from '@/components/player/hooks/useVideoResolution';
+import { useResolutionProbe } from '@/lib/hooks/useResolutionProbe';
+import { setCachedResolution } from '@/lib/player/resolution-cache';
 import { useVideoPlayer } from '@/lib/hooks/useVideoPlayer';
 import { useHistory } from '@/lib/store/history-store';
 import { FavoritesSidebar } from '@/components/favorites/FavoritesSidebar';
@@ -18,6 +20,17 @@ import { settingsStore } from '@/lib/store/settings-store';
 import { premiumModeSettingsStore } from '@/lib/store/premium-mode-settings';
 import { SegmentedControl } from '@/components/ui/SegmentedControl';
 import { getSourceName } from '@/lib/utils/source-names';
+import { retrieveGroupedSources, storeGroupedSources } from '@/lib/utils/grouped-sources-cache';
+
+type PlayerViewportMode = 'standard' | 'wide' | 'cinema';
+
+const PLAYER_VIEWPORT_MODE_KEY = 'kvideo-player-viewport-mode';
+const PLAYER_VIEWPORT_MODE_ORDER: PlayerViewportMode[] = ['standard', 'wide', 'cinema'];
+const PLAYER_VIEWPORT_MODE_LABELS: Record<PlayerViewportMode, string> = {
+  standard: '标准',
+  wide: '宽屏',
+  cinema: '影院',
+};
 
 function PlayerContent() {
   const searchParams = useSearchParams();
@@ -29,7 +42,10 @@ function PlayerContent() {
   const source = searchParams.get('source');
   const title = searchParams.get('title');
   const episodeParam = searchParams.get('episode');
+  // Support both legacy 'groupedSources' (full JSON) and new 'gs' (sessionStorage key)
   const groupedSourcesParam = searchParams.get('groupedSources');
+  const gsKey = searchParams.get('gs');
+  const missingRequiredParams = !videoId || !source;
 
   // Track settings - use mode-specific store
   const modeStore = isPremium ? premiumModeSettingsStore : settingsStore;
@@ -39,17 +55,80 @@ function PlayerContent() {
 
   // Mobile tab state
   const [activeTab, setActiveTab] = useState<'episodes' | 'info'>('episodes');
+  const [playerViewportMode, setPlayerViewportMode] = useState<PlayerViewportMode>(() => {
+    if (typeof window === 'undefined') return 'standard';
+    const saved = localStorage.getItem(PLAYER_VIEWPORT_MODE_KEY);
+    return saved === 'wide' || saved === 'cinema' || saved === 'standard' ? saved : 'standard';
+  });
+  const [isSourceSectionCollapsed, setIsSourceSectionCollapsed] = useState(false);
+  const [isEpisodeSectionCollapsed, setIsEpisodeSectionCollapsed] = useState(false);
 
   // Sync with store changes if any (though usually it's one-way from UI to store)
   useEffect(() => {
     setIsReversed(modeStore.getSettings().episodeReverseOrder);
-  }, []);
+  }, [modeStore]);
 
-  // Redirect if no video ID or source
-  if (!videoId || !source) {
-    router.push('/');
-    return null;
-  }
+  useEffect(() => {
+    localStorage.setItem(PLAYER_VIEWPORT_MODE_KEY, playerViewportMode);
+  }, [playerViewportMode]);
+
+  // Migrate legacy long groupedSources URL to short gs key
+  useEffect(() => {
+    if (groupedSourcesParam && !gsKey) {
+      try {
+        const data = JSON.parse(groupedSourcesParam);
+        if (Array.isArray(data) && data.length > 0) {
+          const newKey = storeGroupedSources(data);
+          if (newKey) {
+            const params = new URLSearchParams(searchParams.toString());
+            params.delete('groupedSources');
+            params.set('gs', newKey);
+            router.replace(`/player?${params.toString()}`, { scroll: false });
+          }
+        }
+      } catch { /* ignore parse errors */ }
+    }
+  }, [groupedSourcesParam, gsKey, router, searchParams]);
+
+  useEffect(() => {
+    if (missingRequiredParams) {
+      router.push('/');
+    }
+  }, [missingRequiredParams, router]);
+
+  const [pendingFallback, setPendingFallback] = useState(false);
+  const [discoveredSources, setDiscoveredSources] = useState<SourceInfo[]>([]);
+  const groupedSourcesRef = useRef<SourceInfo[]>([]);
+
+  const handleSourceUnavailable = useCallback(() => {
+    const groupedSources = groupedSourcesRef.current;
+    const alternatives = groupedSources.filter((item) => item.source !== source);
+    if (alternatives.length === 0) {
+      setPendingFallback(true);
+      return;
+    }
+
+    setPendingFallback(false);
+    const best = [...alternatives].sort((left, right) => {
+      const latA = left.latency ?? Infinity;
+      const latB = right.latency ?? Infinity;
+      return latA - latB;
+    })[0];
+
+    const params = new URLSearchParams();
+    params.set('id', String(best.id));
+    params.set('source', best.source);
+    params.set('title', title || '');
+    if (episodeParam) params.set('episode', episodeParam);
+    if (gsKey) {
+      params.set('gs', gsKey);
+    } else if (groupedSources.length > 1) {
+      const newKey = storeGroupedSources(groupedSources);
+      if (newKey) params.set('gs', newKey);
+    }
+    if (isPremium) params.set('premium', '1');
+    router.replace(`/player?${params.toString()}`, { scroll: false });
+  }, [episodeParam, gsKey, isPremium, router, source, title]);
 
   const {
     videoData,
@@ -61,14 +140,15 @@ function PlayerContent() {
     setPlayUrl,
     setVideoError,
     fetchVideoDetails,
-  } = useVideoPlayer(videoId, source, episodeParam, isReversed);
-
-  // Parse grouped sources if available
-  const [discoveredSources, setDiscoveredSources] = useState<SourceInfo[]>([]);
+  } = useVideoPlayer(videoId, source, episodeParam, isReversed, handleSourceUnavailable);
 
   const groupedSources = useMemo<SourceInfo[]>(() => {
     let sources: SourceInfo[] = [];
-    if (groupedSourcesParam) {
+
+    if (gsKey) {
+      const cached = retrieveGroupedSources(gsKey);
+      if (cached) sources = cached;
+    } else if (groupedSourcesParam) {
       try {
         sources = JSON.parse(groupedSourcesParam);
       } catch {
@@ -76,26 +156,41 @@ function PlayerContent() {
       }
     }
 
-    // Merge in discovered sources (from background search)
     if (discoveredSources.length > 0) {
       for (const ds of discoveredSources) {
-        if (!sources.find(s => s.source === ds.source)) {
+        if (!sources.find((item) => item.source === ds.source)) {
           sources.push(ds);
         }
       }
     }
 
-    // Always ensure the current source is in the list
-    if (source && !sources.find(s => s.source === source)) {
+    if (source && !sources.find((item) => item.source === source)) {
       sources.unshift({
         id: videoId || '',
-        source: source,
+        source,
         sourceName: getSourceName(source),
-        pic: videoData?.vod_pic
+        pic: videoData?.vod_pic,
       });
     }
+
+    const fallbackPic = videoData?.vod_pic;
+    if (fallbackPic) {
+      sources = sources.map((item) => item.pic ? item : { ...item, pic: fallbackPic });
+    }
+
     return sources;
-  }, [groupedSourcesParam, source, videoId, videoData?.vod_pic, discoveredSources]);
+  }, [discoveredSources, groupedSourcesParam, gsKey, source, videoData?.vod_pic, videoId]);
+
+  useEffect(() => {
+    groupedSourcesRef.current = groupedSources;
+  }, [groupedSources]);
+
+  // Retry pending fallback when discovered sources arrive
+  useEffect(() => {
+    if (pendingFallback && discoveredSources.length > 0) {
+      handleSourceUnavailable();
+    }
+  }, [discoveredSources, handleSourceUnavailable, pendingFallback]);
 
   // Background fetch alternative sources when none provided or when existing ones lack full info
   const fetchedSourcesRef = useRef(false);
@@ -104,10 +199,14 @@ function PlayerContent() {
 
     // Check if existing grouped sources already have full info (pic + latency)
     let existingSources: SourceInfo[] = [];
-    if (groupedSourcesParam) {
+    if (gsKey) {
+      const cached = retrieveGroupedSources(gsKey);
+      if (cached) existingSources = cached;
+    } else if (groupedSourcesParam) {
       try { existingSources = JSON.parse(groupedSourcesParam); } catch {}
     }
-    const hasFullInfo = existingSources.length > 1 &&
+    // Always fetch alternatives if there's a pending fallback (source unavailable)
+    const hasFullInfo = !pendingFallback && existingSources.length > 1 &&
       existingSources.every(s => s.pic || s.latency !== undefined);
     if (hasFullInfo) return;
 
@@ -151,7 +250,16 @@ function PlayerContent() {
               const data = JSON.parse(line.slice(6));
               if (data.type === 'videos' && data.videos) {
                 // Find exact or close title match
-                const match = data.videos.find((v: any) =>
+                const match = data.videos.find((v: {
+                  vod_name?: string;
+                  vod_id: string | number;
+                  source: string;
+                  sourceDisplayName?: string;
+                  latency?: number;
+                  vod_pic?: string;
+                  type_name?: string;
+                  vod_remarks?: string;
+                }) =>
                   v.vod_name?.toLowerCase().trim() === normalizedTitle
                 );
                 if (match) {
@@ -161,6 +269,8 @@ function PlayerContent() {
                     sourceName: match.sourceDisplayName || getSourceName(match.source),
                     latency: match.latency,
                     pic: match.vod_pic,
+                    typeName: match.type_name,
+                    remarks: match.vod_remarks,
                   });
                   // Update state incrementally
                   setDiscoveredSources([...found]);
@@ -175,15 +285,43 @@ function PlayerContent() {
     })();
 
     return () => controller.abort();
-  }, [title, source, groupedSourcesParam, isPremium]);
+  }, [groupedSourcesParam, gsKey, isPremium, pendingFallback, source, title]);
 
   // Track current source for switching
   const [currentSourceId, setCurrentSourceId] = useState(source);
   const playerTimeRef = useRef(0);
 
+  useEffect(() => {
+    setCurrentSourceId(source);
+  }, [source]);
+
+  // Track detected video resolution from the player
+  const [detectedResolution, setDetectedResolution] = useState<VideoResolutionInfo | null>(null);
+
+  // Probe resolution for all grouped sources (not just the playing one)
+  const probeList = useMemo(() => {
+    return groupedSources.map((item) => ({
+      id: item.id,
+      source: item.source,
+      episodeIndex: currentEpisode,
+    }));
+  }, [groupedSources, currentEpisode]);
+  const { resolutions: sourceResolutions } = useResolutionProbe(probeList);
+
+  const handleResolutionDetected = useCallback((info: VideoResolutionInfo) => {
+    setDetectedResolution(info);
+    if (videoId && source) {
+      setCachedResolution(source, videoId, {
+        ...info,
+        origin: 'played',
+        episodeIndex: currentEpisode,
+      });
+    }
+  }, [currentEpisode, source, videoId]);
+
   // Add initial history entry when video data is loaded
   useEffect(() => {
-    if (videoData && playUrl && videoId) {
+    if (videoData && playUrl && videoId && source) {
       // Map episodes to include index
       const mappedEpisodes = videoData.episodes?.map((ep, idx) => ({
         name: ep.name || `第${idx + 1}集`,
@@ -206,7 +344,7 @@ function PlayerContent() {
     }
   }, [videoData, playUrl, videoId, currentEpisode, source, title, addToHistory]);
 
-  const handleEpisodeClick = useCallback((episode: any, index: number) => {
+  const handleEpisodeClick = useCallback((episode: { url: string }, index: number) => {
     setCurrentEpisode(index);
     setPlayUrl(episode.url);
     setVideoError('');
@@ -244,14 +382,31 @@ function PlayerContent() {
     if (nextEpisode) {
       handleEpisodeClick(nextEpisode, nextIndex); // handleEpisodeClick relies on state setters, which are stable
     }
-  }, [videoData, currentEpisode, isReversed, router, searchParams]); // handleEpisodeClick is not memoized, but uses stable hooks setters. wait, handleEpisodeClick is inline too!
+  }, [currentEpisode, handleEpisodeClick, isReversed, videoData]);
+
+  const effectivePlayerViewportMode = useMemo<PlayerViewportMode>(() => {
+    const manualIndex = PLAYER_VIEWPORT_MODE_ORDER.indexOf(playerViewportMode);
+    const collapsedCount = Number(isSourceSectionCollapsed) + Number(isEpisodeSectionCollapsed);
+    const autoIndex = Math.min(collapsedCount, PLAYER_VIEWPORT_MODE_ORDER.length - 1);
+    return PLAYER_VIEWPORT_MODE_ORDER[Math.max(manualIndex, autoIndex)];
+  }, [playerViewportMode, isSourceSectionCollapsed, isEpisodeSectionCollapsed]);
+
+  const playerGridClass = effectivePlayerViewportMode === 'cinema'
+    ? 'xl:grid-cols-[minmax(0,1.9fr)_minmax(280px,0.55fr)]'
+    : effectivePlayerViewportMode === 'wide'
+      ? 'xl:grid-cols-[minmax(0,1.65fr)_minmax(300px,0.72fr)]'
+      : 'xl:grid-cols-[minmax(0,1.45fr)_minmax(320px,0.9fr)]';
+
+  if (missingRequiredParams) {
+    return null;
+  }
 
   return (
     <div className="min-h-screen bg-[var(--bg-color)]">
       {/* Glass Navbar */}
       <PlayerNavbar isPremium={isPremium} />
 
-      <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 pb-20">
+      <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 pb-20 pt-2">
         {loading ? (
           <div className="flex flex-col items-center justify-center py-20">
             <div className="animate-spin rounded-full h-16 w-16 border-4 border-[var(--accent-color)] border-t-transparent mb-4"></div>
@@ -264,22 +419,49 @@ function PlayerContent() {
             onRetry={fetchVideoDetails}
           />
         ) : (
-          <div className="grid lg:grid-cols-3 gap-6">
-            {/* Video Player Section */}
-            <div className="lg:col-span-2 space-y-6">
-              <VideoPlayer
-                playUrl={playUrl}
-                videoId={videoId || undefined}
-                currentEpisode={currentEpisode}
-                onBack={() => router.back()}
-                totalEpisodes={videoData?.episodes?.length || 0}
-                onNextEpisode={handleNextEpisode}
-                isReversed={isReversed}
-                isPremium={isPremium}
-                videoTitle={videoData?.vod_name || title || ''}
-                episodeName={videoData?.episodes?.[currentEpisode]?.name || ''}
-                externalTimeRef={playerTimeRef}
+          <div className="space-y-4">
+            {/* Viewport controls span full content width so player + sidebar tops align */}
+            <div className="hidden lg:flex items-center justify-between gap-4 rounded-[var(--radius-2xl)] border border-[var(--glass-border)] bg-[var(--glass-bg)] p-4">
+              <div>
+                <div className="text-sm font-semibold text-[var(--text-color)]">
+                  播放窗口大小
+                </div>
+                <div className="text-xs text-[var(--text-color-secondary)] mt-1">
+                  右侧源列表或选集折叠后，会自动提升到更宽的布局
+                  {effectivePlayerViewportMode !== playerViewportMode && `，当前已自动切到${PLAYER_VIEWPORT_MODE_LABELS[effectivePlayerViewportMode]}`}
+                </div>
+              </div>
+              <SegmentedControl<PlayerViewportMode>
+                options={[
+                  { label: '标准', value: 'standard' },
+                  { label: '宽屏', value: 'wide' },
+                  { label: '影院', value: 'cinema' },
+                ]}
+                value={playerViewportMode}
+                onChange={setPlayerViewportMode}
+                className="min-w-[240px]"
               />
+            </div>
+
+          <div className={`grid gap-6 lg:grid-cols-3 lg:items-start ${playerGridClass}`}>
+            {/* Video Player Section */}
+            <div className="lg:col-span-2 xl:col-span-1 space-y-6">
+              <div className="sm:mx-0">
+                <VideoPlayer
+                  playUrl={playUrl}
+                  videoId={videoId || undefined}
+                  currentEpisode={currentEpisode}
+                  onBack={() => router.back()}
+                  totalEpisodes={videoData?.episodes?.length || 0}
+                  onNextEpisode={handleNextEpisode}
+                  isReversed={isReversed}
+                  isPremium={isPremium}
+                  videoTitle={videoData?.vod_name || title || ''}
+                  episodeName={videoData?.episodes?.[currentEpisode]?.name || ''}
+                  externalTimeRef={playerTimeRef}
+                  onResolutionDetected={handleResolutionDetected}
+                />
+              </div>
               <div className="hidden lg:block">
                 <VideoMetadata
                   videoData={videoData}
@@ -298,6 +480,9 @@ function PlayerContent() {
                     poster={videoData.vod_pic}
                     type={videoData.type_name}
                     year={videoData.vod_year}
+                    sourceMap={Object.fromEntries(
+                      (groupedSources.length > 0 ? groupedSources : [{ id: videoId, source }]).map((item) => [item.source, item.id])
+                    )}
                     size={20}
                     isPremium={isPremium}
                   />
@@ -308,9 +493,9 @@ function PlayerContent() {
               )}
             </div>
 
-            {/* Sidebar with sticky wrapper */}
+            {/* Sidebar with sticky wrapper — top offset matches navbar height for alignment */}
             <div className="lg:col-span-1">
-              <div className="lg:sticky lg:top-32 space-y-6">
+              <div className="lg:sticky lg:top-28 space-y-6">
                 {/* Mobile Tabs */}
                 <SegmentedControl
                   options={[
@@ -341,6 +526,12 @@ function PlayerContent() {
                     onToggleReverse={handleToggleReverse}
                     sources={groupedSources.length > 0 ? groupedSources : undefined}
                     currentSource={currentSourceId || source || ''}
+                    currentResolution={detectedResolution}
+                    sourceResolutions={sourceResolutions}
+                    sourceSectionCollapsed={isSourceSectionCollapsed}
+                    onSourceSectionCollapseChange={setIsSourceSectionCollapsed}
+                    episodeSectionCollapsed={isEpisodeSectionCollapsed}
+                    onEpisodeSectionCollapseChange={setIsEpisodeSectionCollapsed}
                     onSourceChange={(newSource) => {
                       const params = new URLSearchParams();
                       params.set('id', String(newSource.id));
@@ -352,12 +543,13 @@ function PlayerContent() {
                       if (playerTimeRef.current > 1) {
                         params.set('t', Math.floor(playerTimeRef.current).toString());
                       }
-                      // Pass all known sources so switching persists
+                      // Store all known sources using short gs key
                       const allSources = groupedSources.length > 0 ? groupedSources : [];
                       if (allSources.length > 1) {
-                        params.set('groupedSources', JSON.stringify(allSources));
-                      } else if (groupedSourcesParam) {
-                        params.set('groupedSources', groupedSourcesParam);
+                        const newKey = storeGroupedSources(allSources);
+                        if (newKey) params.set('gs', newKey);
+                      } else if (gsKey) {
+                        params.set('gs', gsKey);
                       }
                       if (isPremium) {
                         params.set('premium', '1');
@@ -369,6 +561,7 @@ function PlayerContent() {
                 </div>
               </div>
             </div>
+          </div>
           </div>
         )}
       </main>
